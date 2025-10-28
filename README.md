@@ -6,6 +6,7 @@ Short advisories and minimal, defanged PoCs for vulnerabilities I discovered. Ea
     <img src="https://img.shields.io/twitter/follow/abdulr7mann" alt="Twitter">
   </a>
 </p>
+
 ## Structure
 ```
 CVEs/
