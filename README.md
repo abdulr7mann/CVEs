@@ -18,6 +18,7 @@ CVEs/
 
 ## Quick Start
 - Advisory: `CVEs/CVE-*/CVE-YYYY-NNNN.md`
+- Detailed Technical Analysis `CVE-YYYY-NNNN-blog.md`
 - PoC (defanged): `CVEs/CVE-*/CVE-YYYY-NNNN.py`
 
 > PoCs are **for authorized testing only** and intentionally limited. See [DISCLAIMER](./DISCLAIMER.md).
