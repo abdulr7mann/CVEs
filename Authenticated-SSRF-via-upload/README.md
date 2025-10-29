@@ -88,7 +88,7 @@ python3 exploit.py http://localhost:8090 --username user --password pass
 python3 exploit.py http://localhost:8090 --username user --password pass --target "http://internal-db:5432"
 ```
 
-See [detailed technical analysis](tech-blog.md) for comprehensive exploitation methodology including authentication framework.
+See [detailed technical analysis](deep-technical-analysis.md) for comprehensive exploitation methodology including authentication framework.
 
 ---
 
@@ -115,7 +115,7 @@ See [detailed technical analysis](tech-blog.md) for comprehensive exploitation m
 
 ## References
 
-- [Technical Analysis & Authentication Framework](tech-blog.md)
+- [Technical Analysis & Authentication Framework](deep-technical-analysis.md)
 - [CWE-918: Server-Side Request Forgery](https://cwe.mitre.org/data/definitions/918.html)
 - [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)
 
