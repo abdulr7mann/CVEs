@@ -21,7 +21,7 @@ While auditing Halo CMS's attachment upload service, I uncovered a Server-Side R
 - Unique characteristic: Dual HTTP requests (HEAD + GET) with response data saved as attachments
 - Status: Vendor notified Oct 25, 2024 | Public disclosure Oct 27, 2024
 
-**Related:** This is the second SSRF vulnerability discovered in Halo CMS. See also: [Unauthenticated SSRF in Thumbnail Service](../CVE-2025-60898/CVE-2025-60898-blog-writeup.md) (CVSS 9.1 Critical)
+**Related:** This is the second SSRF vulnerability discovered in Halo CMS. See also: [Unauthenticated SSRF in Thumbnail Service](../CVE-2025-60898/deep-technical-analysis.md) (CVSS 9.1 Critical)
 
 ---
 
