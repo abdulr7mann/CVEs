@@ -376,8 +376,7 @@ curl -s "http://localhost:8090/console" | grep -oP 'publicKey.*?"([^"]+)"' | cut
 
 ```bash
 # Terminal 1: Start canary server on port 8889
-echo "SSRF_UPLOAD_SUCCESS" > /tmp/upload-canary.txt
-python3 -m http.server 8889 --directory /tmp
+python3 -m http.server 8889
 
 # You should see: Serving HTTP on 0.0.0.0 port 8889...
 ```
